@@ -34,4 +34,4 @@ const LOD_LOW_THRESHOLD: float = 500.0 * NM
 
 # MEGA-MOLECULE PARAMETERS
 const NUCLEOID_BP_COUNT: int = 4_600_000
-const CHUNK_BP_SIZE: int = 10_000 # ~460 chunks for nucleoid
+const CHUNK_BP_SIZE: int = 100 # Base pairs per chunk (30 chunks for 3000bp plasmid)

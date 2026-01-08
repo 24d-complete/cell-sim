@@ -13,8 +13,12 @@ const MoleculeLODScript = preload("res://scripts/MoleculeLOD.gd")
 const LODConfigScript = preload("res://scripts/LODConfig.gd")
 
 # LOD System
-var dna_lod = null # MoleculeLOD instance
 var lod_shader: Shader = null
+
+# Chunked DNA storage
+# chunks[chunk_idx] = {center: Vector3, instances: Array[4 MeshInstance3D], current_lod: int}
+var dna_chunks: Array = []
+var dna_container: Node3D = null
 
 var cam_distance = 45.0 # View Further out
 var cam_rot_x = 0.0
@@ -24,10 +28,16 @@ var is_ready = false
 
 # Configuration
 const BASE_PAIRS = 3000
+const CHUNK_SIZE = BioScale.CHUNK_BP_SIZE # 100 bp per chunk
+var NUM_CHUNKS: int
+
+# LOD thresholds (distance in nm)
+var lod_thresholds = [50.0, 150.0, 500.0] # 3 thresholds for 4 LODs
 
 func _ready():
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE # Keep visible during load
 	lod_shader = preload("res://shaders/lod_transition.gdshader")
+	NUM_CHUNKS = ceili(float(BASE_PAIRS) / float(CHUNK_SIZE))
 	_async_init()
 
 func _async_init():
@@ -36,30 +46,14 @@ func _async_init():
 	_log("Initializing Atomic Database...")
 	await get_tree().process_frame
 	
-	# 1. DNA with LOD System
-	_log("Synthesizing Plasmid (%d bp) with LOD..." % BASE_PAIRS)
+	# Create container for all DNA chunks
+	dna_container = Node3D.new()
+	dna_container.name = "DNAChunks"
+	add_child(dna_container)
 	
-	# Create LOD-enabled DNA node
-	dna_lod = MoleculeLODScript.new()
-	dna_lod.set_camera(camera)
-	
-	# Configure LOD thresholds based on molecule size
-	var dna_config = LODConfigScript.create_dna_config(BASE_PAIRS)
-	dna_lod.lod_thresholds = dna_config.lod_thresholds
-	
-	# Create LOD material template
-	var lod_material = ShaderMaterial.new()
-	lod_material.shader = lod_shader
-	dna_lod.material_template = lod_material
-	
-	# Connect LOD change signal for logging
-	dna_lod.lod_changed.connect(_on_dna_lod_changed)
-	
-	add_child(dna_lod)
-	
-	# Generate meshes for each LOD level
-	_log("Generating LOD meshes...")
-	await _generate_dna_lod_meshes(molecules["Nucleotide"])
+	# Generate chunked DNA with LOD
+	_log("Synthesizing Chunked Plasmid (%d bp, %d chunks)..." % [BASE_PAIRS, NUM_CHUNKS])
+	await _generate_chunked_dna(molecules["Nucleotide"])
 	
 	_log("[color=green]Initialization Complete.[/color]")
 	status_label.text = "Simulation Ready"
@@ -74,138 +68,171 @@ func _async_init():
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	is_ready = true
 
-func _generate_dna_lod_meshes(nucleotide_atoms: Array) -> void:
-	# Clear existing LOD meshes
-	for child in dna_lod.get_children():
-		child.queue_free()
-	dna_lod.lod_meshes.clear()
-	dna_lod.lod_instances.clear()
-	
-	# LOD level configurations
+func _generate_chunked_dna(nucleotide_atoms: Array) -> void:
+	# LOD level configurations - 4 levels
 	var lod_configs = [
-		{"segments": 6, "rings": 4, "bond_segs": 4, "skip_h": false, "blur": 0.0}, # Full
-		{"segments": 4, "rings": 3, "bond_segs": 3, "skip_h": true, "blur": 0.0}, # Medium
-		{"segments": 2, "rings": 2, "bond_segs": 2, "skip_h": true, "blur": 0.3}, # Low
-		{"segments": 1, "rings": 1, "bond_segs": 0, "skip_h": true, "blur": 0.6}, # Ultra-low
+		{"segments": 6, "rings": 4, "bond_segs": 4, "skip_h": false, "blur": 0.0}, # LOD 0: High
+		{"segments": 4, "rings": 3, "bond_segs": 3, "skip_h": true, "blur": 0.0}, # LOD 1: Medium
+		{"segments": 2, "rings": 2, "bond_segs": 2, "skip_h": true, "blur": 0.3}, # LOD 2: Low
+		{"segments": 1, "rings": 1, "bond_segs": 0, "skip_h": true, "blur": 0.6}, # LOD 3: Ultra-Low
 	]
 	
-	# Ensure cache directory exists (using res:// to keep as project assets)
+	# Ensure cache directory exists
 	var cache_dir = "res://lod_cache"
 	if not DirAccess.dir_exists_absolute(cache_dir):
 		var err = DirAccess.make_dir_absolute(cache_dir)
 		if err != OK:
 			print("Error creating cache dir: ", err)
-		
-	for lod_idx in range(lod_configs.size()):
-		var config = lod_configs[lod_idx]
-		var cache_file = "dna_v3_%d_lod%d.res" % [BASE_PAIRS, lod_idx]
-		var cache_path = cache_dir + "/" + cache_file
-		var mesh: ArrayMesh
-		
-		# Check if file exists
-		if FileAccess.file_exists(cache_path):
-			print("Cache Hit: ", cache_path)
-			_log("Loading LOD %d from cache..." % lod_idx)
-			status_label.text = "Loading LOD %d / %d (Cached)" % [lod_idx + 1, lod_configs.size()]
-			await get_tree().process_frame
-			mesh = ResourceLoader.load(cache_path)
-		else:
-			print("Cache Miss: ", cache_path)
-			# Not in cache, generate it
-			_log("Generating LOD %d mesh..." % lod_idx)
-			status_label.text = "Generating LOD %d / %d" % [lod_idx + 1, lod_configs.size()]
-			await get_tree().process_frame
-			
-			mesh = await _create_dna_helix_lod(
-				nucleotide_atoms,
-				config["segments"],
-				config["rings"],
-				config["bond_segs"],
-				config["skip_h"]
-			)
-			
-			# Save to cache
-			_log("Saving LOD %d to cache..." % lod_idx)
-			var err = ResourceSaver.save(mesh, cache_path)
-			if err != OK:
-				print("Failed to save mesh to cache: ", err)
-
-		
-		dna_lod.lod_meshes.append(mesh)
-		
-		# Create instance
-		var instance = MeshInstance3D.new()
-		instance.mesh = mesh
-		instance.visible = (lod_idx == 0)
-		
-		# Apply material
-		if lod_idx == 0:
-			# LOD 0: Use Original StandardMaterial3D for AAA look
-			var mat = StandardMaterial3D.new()
-			mat.vertex_color_use_as_albedo = true
-			mat.diffuse_mode = BaseMaterial3D.DIFFUSE_TOON
-			mat.specular_mode = BaseMaterial3D.SPECULAR_TOON
-			mat.roughness = 0.3
-			mat.rim_enabled = true
-			mat.rim = 0.5
-			instance.material_override = mat
-		else:
-			# LOD 1+: Use Shader for Blur/Fade transitions
-			var mat = ShaderMaterial.new()
-			mat.shader = lod_shader
-			mat.set_shader_parameter("blur_amount", config["blur"])
-			mat.set_shader_parameter("blur_start", dna_lod.lod_thresholds[0] if lod_idx > 0 else 1000.0)
-			mat.set_shader_parameter("blur_end", dna_lod.lod_thresholds[lod_idx] if lod_idx < dna_lod.lod_thresholds.size() else 1000.0)
-			instance.material_override = mat
-		
-		dna_lod.add_child(instance)
-		dna_lod.lod_instances.append(instance)
 	
-	dna_lod.current_lod = 0
-
-func _create_dna_helix_lod(nucleotide_atoms: Array, sphere_segs: int, sphere_rings: int, bond_segs: int, skip_h: bool) -> ArrayMesh:
-	var st = SurfaceTool.new()
-	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	# Precompute shared geometry templates
+	var geometry_templates = _create_geometry_templates(lod_configs)
 	
-	# Geometry caching with LOD-appropriate detail
-	var sphere = SphereMesh.new()
-	sphere.radial_segments = sphere_segs
-	sphere.rings = sphere_rings
-	var s_arrays = sphere.get_mesh_arrays()
-	var s_verts = s_arrays[Mesh.ARRAY_VERTEX]
-	var s_norms = s_arrays[Mesh.ARRAY_NORMAL]
-	var s_inds = s_arrays[Mesh.ARRAY_INDEX]
-	
-	var bond_mesh = CylinderMesh.new()
-	bond_mesh.top_radius = 1.0
-	bond_mesh.bottom_radius = 1.0
-	bond_mesh.height = 1.0
-	bond_mesh.radial_segments = max(bond_segs, 2)
-	bond_mesh.rings = 1
-	var b_arrays = bond_mesh.get_mesh_arrays()
-	var b_verts = b_arrays[Mesh.ARRAY_VERTEX]
-	var b_norms = b_arrays[Mesh.ARRAY_NORMAL]
-	var b_inds = b_arrays[Mesh.ARRAY_INDEX]
-	
-	var current_verts = 0
-	
-	# Supercoiled Plasmid Parameters (Using BioScale)
+	# Supercoiled Plasmid Parameters
 	var major_radius = 40.0 * BioScale.NM
 	var minor_radius = 8.0 * BioScale.NM
 	var coils = 16.0
+	
+	# Generate each chunk
+	for chunk_idx in range(NUM_CHUNKS):
+		var start_bp = chunk_idx * CHUNK_SIZE
+		var end_bp = min(start_bp + CHUNK_SIZE, BASE_PAIRS)
+		
+		# Calculate chunk center position (midpoint of segment)
+		var mid_bp = (start_bp + end_bp) / 2.0
+		var mid_t = mid_bp / float(BASE_PAIRS) * TAU
+		var mid_coil = mid_t * coils
+		var mid_cx = (major_radius + minor_radius * cos(mid_coil)) * cos(mid_t)
+		var mid_cz = (major_radius + minor_radius * cos(mid_coil)) * sin(mid_t)
+		var mid_cy = minor_radius * sin(mid_coil)
+		var chunk_center = Vector3(mid_cx, mid_cy, mid_cz)
+		
+		# Create chunk data structure
+		var chunk_data = {
+			"center": chunk_center,
+			"instances": [],
+			"current_lod": 0
+		}
+		
+		# Create container for this chunk's LOD meshes
+		var chunk_node = Node3D.new()
+		chunk_node.name = "Chunk_%d" % chunk_idx
+		dna_container.add_child(chunk_node)
+		
+		# Generate/load meshes for each LOD level
+		for lod_idx in range(lod_configs.size()):
+			var config = lod_configs[lod_idx]
+			var cache_file = "dna_v6_chunk%d_lod%d.res" % [chunk_idx, lod_idx]
+			var cache_path = cache_dir + "/" + cache_file
+			var mesh: ArrayMesh
+			
+			# Update progress
+			var total_items = NUM_CHUNKS * lod_configs.size()
+			var current_item = chunk_idx * lod_configs.size() + lod_idx
+			var progress = float(current_item) / float(total_items) * 100.0
+			progress_bar.value = progress
+			status_label.text = "Chunk %d/%d, LOD %d" % [chunk_idx + 1, NUM_CHUNKS, lod_idx]
+			
+			# Check cache
+			if FileAccess.file_exists(cache_path):
+				mesh = ResourceLoader.load(cache_path)
+			else:
+				# Generate mesh for this chunk and LOD
+				await get_tree().process_frame
+				mesh = await _create_chunk_mesh(
+					nucleotide_atoms,
+					start_bp, end_bp,
+					config,
+					geometry_templates[lod_idx],
+					major_radius, minor_radius, coils
+				)
+				
+				# Save to cache
+				var err = ResourceSaver.save(mesh, cache_path)
+				if err != OK:
+					print("Failed to save mesh to cache: ", err)
+			
+			# Create MeshInstance3D for this LOD
+			var instance = MeshInstance3D.new()
+			instance.mesh = mesh
+			instance.visible = (lod_idx == 0) # Only LOD 0 visible initially
+			
+			# Apply material
+			if lod_idx == 0:
+				var mat = StandardMaterial3D.new()
+				mat.vertex_color_use_as_albedo = true
+				mat.diffuse_mode = BaseMaterial3D.DIFFUSE_TOON
+				mat.specular_mode = BaseMaterial3D.SPECULAR_TOON
+				mat.roughness = 0.3
+				mat.rim_enabled = true
+				mat.rim = 0.5
+				instance.material_override = mat
+			else:
+				var mat = ShaderMaterial.new()
+				mat.shader = lod_shader
+				mat.set_shader_parameter("blur_amount", config["blur"])
+				mat.set_shader_parameter("blur_start", lod_thresholds[0])
+				mat.set_shader_parameter("blur_end", lod_thresholds[lod_idx - 1] if lod_idx > 0 else 1000.0)
+				instance.material_override = mat
+			
+			chunk_node.add_child(instance)
+			chunk_data["instances"].append(instance)
+		
+		dna_chunks.append(chunk_data)
+		
+		# Yield periodically to prevent freezing
+		if chunk_idx % 5 == 0:
+			await get_tree().process_frame
+
+func _create_geometry_templates(lod_configs: Array) -> Array:
+	# Pre-generate sphere and bond mesh arrays for each LOD level
+	var templates = []
+	for config in lod_configs:
+		var sphere = SphereMesh.new()
+		sphere.radial_segments = config["segments"]
+		sphere.rings = config["rings"]
+		var s_arrays = sphere.get_mesh_arrays()
+		
+		var bond = CylinderMesh.new()
+		bond.top_radius = 1.0
+		bond.bottom_radius = 1.0
+		bond.height = 1.0
+		bond.radial_segments = max(config["bond_segs"], 2)
+		bond.rings = 1
+		var b_arrays = bond.get_mesh_arrays()
+		
+		templates.append({
+			"s_verts": s_arrays[Mesh.ARRAY_VERTEX],
+			"s_norms": s_arrays[Mesh.ARRAY_NORMAL],
+			"s_inds": s_arrays[Mesh.ARRAY_INDEX],
+			"b_verts": b_arrays[Mesh.ARRAY_VERTEX],
+			"b_norms": b_arrays[Mesh.ARRAY_NORMAL],
+			"b_inds": b_arrays[Mesh.ARRAY_INDEX],
+			"skip_h": config["skip_h"],
+			"bond_segs": config["bond_segs"]
+		})
+	return templates
+
+func _create_chunk_mesh(nucleotide_atoms: Array, start_bp: int, end_bp: int, config: Dictionary, geom: Dictionary, major_radius: float, minor_radius: float, coils: float) -> ArrayMesh:
+	var st = SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	
+	var s_verts = geom["s_verts"]
+	var s_norms = geom["s_norms"]
+	var s_inds = geom["s_inds"]
+	var b_verts = geom["b_verts"]
+	var b_norms = geom["b_norms"]
+	var b_inds = geom["b_inds"]
+	var skip_h = geom["skip_h"]
+	var bond_segs = geom["bond_segs"]
+	
+	var current_verts = 0
 	
 	# Filter atoms based on LOD
 	var filtered_atoms = nucleotide_atoms
 	if skip_h:
 		filtered_atoms = nucleotide_atoms.filter(func(a): return a["type"] != "H")
 	
-	for i in range(BASE_PAIRS):
-		# Yield every 30 bases to let UI update
-		if i % 30 == 0:
-			var progress = float(i) / float(BASE_PAIRS)
-			progress_bar.value = progress * 100.0
-			await get_tree().process_frame
-			
+	for i in range(start_bp, end_bp):
 		var t = float(i) / float(BASE_PAIRS) * TAU
 		var coil_angle = t * coils
 		var u = t
@@ -245,8 +272,6 @@ func _create_dna_helix_lod(nucleotide_atoms: Array, sphere_segs: int, sphere_rin
 			current_verts = _add_atoms_only(st, filtered_atoms, pos1, orientation * helix_rot, s_verts, s_norms, s_inds, current_verts)
 			current_verts = _add_atoms_only(st, filtered_atoms, pos2, orientation * helix_rot * Basis(Vector3(0, 0, 1), PI), s_verts, s_norms, s_inds, current_verts)
 	
-	status_label.text = "Optimizing Buffer..."
-	await get_tree().process_frame
 	st.generate_normals()
 	return st.commit()
 
@@ -322,20 +347,17 @@ func _add_atoms_only(st, atoms, center, orient, sv, sn, si, v_off):
 func _log(msg: String):
 	log_label.append_text("[center]" + msg + "[/center]\n")
 
-func _on_dna_lod_changed(new_lod: int, old_lod: int):
-	print("DNA LOD changed: %d -> %d" % [old_lod, new_lod])
-
 func _input(event):
 	if not is_ready:
 		return
 	
 	# Visibility Toggles
 	if event is InputEventKey and event.pressed:
-		if event.keycode == KEY_4 and dna_lod:
-			dna_lod.visible = !dna_lod.visible
-		# Debug: Show current LOD
-		if event.keycode == KEY_L and dna_lod:
-			print("Current LOD: %d, Distance: %.1f" % [dna_lod.get_current_lod(), cam_distance])
+		if event.keycode == KEY_4 and dna_container:
+			dna_container.visible = !dna_container.visible
+		# Debug: Show chunk LOD info
+		if event.keycode == KEY_L:
+			_print_chunk_lod_info()
 
 	# Mouse Controls
 	if event is InputEventMouseButton:
@@ -357,12 +379,37 @@ func _input(event):
 			var up = right.cross(forward)
 			cam_offset += (-right * event.relative.x + up * event.relative.y) * pan_speed
 
+func _print_chunk_lod_info():
+	var lod_counts = [0, 0, 0, 0]
+	for chunk in dna_chunks:
+		lod_counts[chunk["current_lod"]] += 1
+	print("Chunk LOD Distribution: LOD0=%d, LOD1=%d, LOD2=%d, LOD3=%d" % lod_counts)
+
 func _process(_delta):
 	var rot_pos = Vector3(0, 0, cam_distance).rotated(Vector3.RIGHT, cam_rot_x).rotated(Vector3.UP, cam_rot_y)
 	if camera:
 		camera.position = rot_pos + cam_offset
 		camera.look_at(cam_offset)
 	
-	# Update LOD based on camera position
-	if dna_lod and is_ready:
-		dna_lod.update_lod(camera.global_position)
+	# Update per-chunk LOD based on camera position
+	if is_ready and dna_chunks.size() > 0:
+		_update_chunk_lods(camera.global_position)
+
+func _update_chunk_lods(camera_pos: Vector3):
+	for chunk in dna_chunks:
+		var dist = camera_pos.distance_to(chunk["center"])
+		
+		# Determine new LOD level based on distance thresholds
+		var new_lod = 0
+		for i in range(lod_thresholds.size()):
+			if dist > lod_thresholds[i]:
+				new_lod = i + 1
+			else:
+				break
+		
+		# Update visibility if LOD changed
+		if new_lod != chunk["current_lod"]:
+			var instances = chunk["instances"]
+			instances[chunk["current_lod"]].visible = false
+			instances[new_lod].visible = true
+			chunk["current_lod"] = new_lod
